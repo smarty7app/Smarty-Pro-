@@ -1,180 +1,319 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
-  Mic, Bell, CheckCircle2, ChevronRight, LogIn, Sparkles
+  Mic, MicOff, Loader2, AlertCircle
 } from 'lucide-react';
-import { motion } from 'motion/react';
-import { format } from 'date-fns';
+import { motion, AnimatePresence } from 'motion/react';
 import { useAuth } from '@/context/AuthContext';
 import { useLanguage } from '@/context/LanguageContext';
-import { signIn, db } from '@/lib/firebase';
-import { collection, query, where, orderBy, onSnapshot } from 'firebase/firestore';
-import Link from 'next/link';
-import { Logo } from '@/components/Logo';
+import { db } from '@/lib/firebase';
+import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 
-export default function Dashboard() {
-  const { user, loading } = useAuth();
+const INPUT_SAMPLE_RATE = 16000;
+const OUTPUT_SAMPLE_RATE = 24000;
+
+function floatTo16BitPCM(float32Array: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+function pcm16ToFloat32(pcmData: ArrayBuffer): Float32Array {
+  const int16Array = new Int16Array(pcmData);
+  const float32Array = new Float32Array(int16Array.length);
+  for (let i = 0; i < int16Array.length; i++) {
+    float32Array[i] = int16Array[i] / 32768;
+  }
+  return float32Array;
+}
+
+import { CenterMic } from '@/components/CenterMic';
+
+import { useSearchParams } from 'next/navigation';
+
+import { Suspense } from 'react';
+
+function AssistantContent() {
+  const { user } = useAuth();
   const { t } = useLanguage();
-  const [reminders, setReminders] = useState<any[]>([]);
-  const [completedCount, setCompletedCount] = useState(0);
+  const searchParams = useSearchParams();
+  const [isLive, setIsLive] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [userTranscription, setUserTranscription] = useState("");
+  const [smartyTranscription, setSmartyTranscription] = useState("");
+  const [reminderCreatedInSession, setReminderCreatedInSession] = useState(false);
+
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
 
   useEffect(() => {
+    const task = searchParams.get('task');
+    const type = searchParams.get('type');
+    
+    if (task && type && user && !isLive && !isConnecting) {
+      startSession({ task, type });
+    }
+  }, [searchParams, user]);
+
+  const startSession = async (initialPrompt?: { task: string, type: string }) => {
     if (!user) return;
+    setError(null);
+    setIsConnecting(true);
+    setReminderCreatedInSession(false);
+    setUserTranscription("");
+    setSmartyTranscription("");
 
-    const q = query(
-      collection(db, 'reminders'),
-      where('userId', '==', user.uid),
-      orderBy('datetime', 'asc')
-    );
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
+      streamRef.current = stream;
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setReminders(data);
-    });
+      const audioContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
+      audioContextRef.current = audioContext;
 
-    return unsubscribe;
-  }, [user]);
+      const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY || '' });
+      
+      const sessionPromise = ai.live.connect({
+        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
+          },
+          systemInstruction: `اسمك هو Smarty (سمارتي). أنت مساعد صوتي ذكي وودود جداً.
+          - تنبيه هام: بمجرد أن تسمع اسمك "Smarty" أو "سمارتي"، يجب أن تقاطع صمتك فوراً وترد بترحيب حار مثل "نعم، أنا معك!" أو "أهلاً بك، كيف أساعدك؟".
+          - لا تنتظر جملة كاملة من المستخدم؛ إذا ناداك باسمك فقط، رد عليه فوراً لتؤكد أنك تسمعه.
+          - مهمتك الأساسية هي مساعدة المستخدم في تنظيم حياته عبر التذكيرات.
+          - إذا طلب المستخدم تذكيره بشيء، استخدم أداة "create_reminder".
+          - كن ودوداً، مختصراً، وذكياً في ردودك.
+          - الوقت الحالي هو: ${new Date().toLocaleString()}.
+          - تحدث باللغة التي يبدأ بها المستخدم (عربي، إنجليزي، أو فرنسي).`,
+          tools: [{
+            functionDeclarations: [{
+              name: "create_reminder",
+              description: "أنشئ تذكيراً جديداً للمستخدم",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  task: { type: Type.STRING, description: "وصف المهمة" },
+                  datetime: { type: Type.STRING, description: "التاريخ والوقت بصيغة ISO" },
+                  priority: { type: Type.STRING, enum: ["low", "medium", "high"] },
+                  category: { type: Type.STRING, description: "تصنيف المهمة (مثلاً: عمل، شخصي، صحة)" }
+                },
+                required: ["task", "datetime"]
+              }
+            }]
+          }]
+        },
+        callbacks: {
+          onopen: () => {
+            setIsConnecting(false);
+            setIsLive(true);
+            
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processorRef.current = processor;
 
-  if (loading) return null;
+            processor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const pcmData = floatTo16BitPCM(inputData);
+              const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData)));
+              sessionPromise.then(session => {
+                if (session) {
+                  session.sendRealtimeInput({ media: { data: base64Data, mimeType: "audio/pcm;rate=16000" } });
+                }
+              });
+            };
 
-  if (!user) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center p-6 text-center space-y-8">
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="space-y-6"
-        >
-          <Logo size={120} className="mx-auto mb-8 shadow-2xl shadow-[#ff4e00]/20" />
-          <h2 className="text-5xl lg:text-7xl font-light leading-tight text-white select-none pointer-events-none">
-            Simple. <span className="italic font-serif text-[#ff4e00]">Smart.</span>
-          </h2>
-          <p className="text-xl text-[#e0d8d0]/60 max-w-md mx-auto">
-            {t('welcome')}
-          </p>
-          <button 
-            onClick={signIn}
-            className="mt-8 flex items-center gap-3 px-10 py-5 bg-[#ff4e00] text-white rounded-full font-bold text-lg hover:bg-[#ff4e00]/90 transition-all shadow-xl shadow-[#ff4e00]/20 mx-auto"
-          >
-            <LogIn className="w-6 h-6" />
-            <span>{t('get_started')}</span>
-          </button>
-        </motion.div>
-      </div>
-    );
-  }
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+
+            if (initialPrompt) {
+              sessionPromise.then(session => {
+                if (session) {
+                  session.sendRealtimeInput({ text: `أريد تذكير المستخدم بخصوص: ${initialPrompt.task}. هذا تذكير ${initialPrompt.type === 'PREPARATION' ? 'مسبق' : 'نهائي'}.` });
+                }
+              });
+            }
+          },
+          onmessage: async (msg: any) => {
+            if (msg.serverContent?.modelTurn?.parts) {
+              for (const part of msg.serverContent.modelTurn.parts) {
+                if (part.inlineData) {
+                  const pcmData = base64ToArrayBuffer(part.inlineData.data);
+                  const float32Data = pcm16ToFloat32(pcmData);
+                  
+                  const audioBuffer = audioContext.createBuffer(1, float32Data.length, OUTPUT_SAMPLE_RATE);
+                  audioBuffer.copyToChannel(float32Data, 0);
+                  
+                  const startTime = Math.max(audioContext.currentTime, nextStartTimeRef.current);
+                  const source = audioContext.createBufferSource();
+                  source.buffer = audioBuffer;
+                  source.connect(audioContext.destination);
+                  source.start(startTime);
+                  
+                  nextStartTimeRef.current = startTime + audioBuffer.duration;
+                }
+                if (part.text) {
+                  setSmartyTranscription(prev => prev + " " + part.text);
+                }
+              }
+            }
+
+            const toolCall = msg.serverContent?.modelTurn?.parts?.find((p: any) => p.functionCall)?.functionCall;
+            if (toolCall?.name === "create_reminder") {
+              const args = toolCall.args as any;
+              try {
+                setReminderCreatedInSession(true);
+                await addDoc(collection(db, 'reminders'), {
+                  ...args,
+                  userId: user.uid,
+                  createdAt: serverTimestamp()
+                });
+                sessionPromise.then(session => {
+                  if (session) {
+                    session.sendToolResponse({
+                      functionResponses: [{
+                        id: toolCall.id,
+                        name: "create_reminder",
+                        response: { success: true }
+                      }]
+                    });
+                  }
+                });
+              } catch (err) {
+                console.error("Failed to save reminder:", err);
+              }
+            }
+          },
+          onclose: () => stopSession(),
+          onerror: (err) => {
+            console.error("Live API error details:", err);
+            setError(t('connection_lost'));
+            stopSession();
+          }
+        }
+      });
+      
+      sessionPromiseRef.current = sessionPromise;
+    } catch (err: any) {
+      console.error("Failed to start session:", err);
+      setError(err.message || "تعذر الاتصال بالذكاء الاصطناعي أو الوصول للميكروفون.");
+      setIsConnecting(false);
+    }
+  };
+
+  const stopSession = async () => {
+    if (sessionPromiseRef.current) {
+      sessionPromiseRef.current.then(session => {
+        if (session) session.close();
+      });
+      sessionPromiseRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsLive(false);
+    setIsConnecting(false);
+  };
 
   return (
-    <div className="flex-1 p-8 lg:p-12 space-y-12 overflow-y-auto custom-scrollbar">
-      <header className="flex flex-col md:flex-row md:items-end justify-between gap-6">
-        <div className="space-y-1">
-          <h2 className="text-5xl font-light text-white tracking-tight">
-            {t('hello')} <span className="font-medium">{user.displayName?.split(' ')[0]}</span>
-          </h2>
-          <p className="text-[#e0d8d0]/30 text-lg">{t('day_at_glance')}</p>
-        </div>
-        <div className="flex items-center gap-6 text-right">
-          <div className="space-y-0.5">
-            <p className="text-white/60 text-sm uppercase tracking-widest font-medium">{format(new Date(), 'EEEE, MMM d')}</p>
-            <p className="text-4xl font-light text-[#ff4e00] font-mono">{format(new Date(), 'HH:mm')}</p>
-          </div>
-        </div>
-      </header>
+    <div className="flex-1 flex flex-col items-center justify-center p-8 relative overflow-hidden">
+      <div className="w-full max-w-lg flex flex-col items-center justify-center space-y-16">
+        <CenterMic 
+          isLive={isLive} 
+          isConnecting={isConnecting} 
+          onClick={isLive ? stopSession : () => startSession()} 
+        />
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Main Action */}
-        <motion.div
-          whileHover={{ scale: 1.01 }}
-          whileTap={{ scale: 0.98 }}
-          className="lg:col-span-8"
-        >
-          <Link 
-            href="/assistant" 
-            className="relative overflow-hidden p-10 bg-[#ff4e00] rounded-[3rem] group cursor-pointer flex flex-col justify-between min-h-[320px] shadow-2xl shadow-[#ff4e00]/20 w-full h-full block"
-          >
-            <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl group-hover:scale-110 transition-transform duration-700" />
-            <div className="w-16 h-16 bg-white/20 rounded-2xl flex items-center justify-center backdrop-blur-md">
-              <Mic className="w-8 h-8 text-white" />
-            </div>
-            <div className="space-y-2 relative z-10">
-              <h3 className="text-4xl font-bold text-white tracking-tight">{t('talk_to_smarty')}</h3>
-              <p className="text-white/80 text-lg max-w-md">{t('start_voice_session')}</p>
-            </div>
-            <div className="flex items-center gap-2 text-white/60 font-medium group-hover:gap-4 transition-all">
-              <span>{t('start_session')}</span>
-              <ChevronRight className="w-5 h-5" />
-            </div>
-          </Link>
-        </motion.div>
-
-        {/* Stats */}
-        <div className="lg:col-span-4 flex flex-col gap-6">
-          <motion.div 
-            whileHover={{ scale: 1.02 }}
-            className="flex-1 p-8 bg-white/5 border border-white/5 rounded-[2.5rem] flex flex-col justify-center space-y-2"
-          >
-            <p className="text-5xl font-light text-white">{reminders.length}</p>
-            <p className="text-xs text-[#e0d8d0]/30 uppercase tracking-[0.2em] font-bold">{t('active_reminders')}</p>
-          </motion.div>
-          <motion.div 
-            whileHover={{ scale: 1.02 }}
-            className="flex-1 p-8 bg-white/5 border border-white/5 rounded-[2.5rem] flex flex-col justify-center space-y-2"
-          >
-            <p className="text-5xl font-light text-white">{completedCount}</p>
-            <p className="text-xs text-[#e0d8d0]/30 uppercase tracking-[0.2em] font-bold">{t('completed_today')}</p>
-          </motion.div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 pt-4">
-        <section className="space-y-8">
-          <div className="flex justify-between items-end">
-            <h3 className="text-2xl font-medium text-white tracking-tight">{t('upcoming')}</h3>
-            <Link href="/reminders" className="text-sm text-[#ff4e00] hover:opacity-80 transition-opacity font-medium">{t('view_all')}</Link>
-          </div>
-          <div className="space-y-4">
-            {reminders.slice(0, 3).map(reminder => (
-              <div key={reminder.id} className="p-6 bg-white/[0.03] border border-white/5 rounded-[2rem] flex items-center justify-between group hover:bg-white/[0.06] transition-all duration-300">
-                <div className="flex items-center gap-6">
-                  <div className={`w-1.5 h-1.5 rounded-full ${reminder.priority === 'high' ? 'bg-[#ff4e00]' : 'bg-blue-500'}`} />
-                  <div>
-                    <h4 className="text-white text-lg font-medium">{reminder.task}</h4>
-                    <p className="text-sm text-[#e0d8d0]/30">{format(new Date(reminder.datetime), 'h:mm a')}</p>
-                  </div>
-                </div>
-                <span className="text-[10px] uppercase tracking-widest font-black text-[#e0d8d0]/10 group-hover:text-[#ff4e00] transition-colors">{reminder.category}</span>
-              </div>
-            ))}
-            {reminders.length === 0 && (
-              <div className="py-16 text-center border border-dashed border-white/5 rounded-[2.5rem] opacity-20 italic text-lg">
-                {t('no_reminders')}
-              </div>
+        <div className="text-center space-y-6">
+          <AnimatePresence mode="wait">
+            {isConnecting ? (
+              <motion.div
+                key="connecting"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="flex items-center gap-3 text-[#ff4e00] font-medium"
+              >
+                <Loader2 className="w-5 h-5 animate-spin" />
+                <span>{t('connecting')}</span>
+              </motion.div>
+            ) : isLive ? (
+              <motion.div
+                key="listening"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-2"
+              >
+                <h3 className="text-3xl font-light text-white tracking-tight">{t('smarty_listening')}</h3>
+                <p className="text-[#e0d8d0]/30 text-sm uppercase tracking-[0.2em] animate-pulse">{t('say_smarty')}</p>
+              </motion.div>
+            ) : (
+              <motion.div
+                key="idle"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-2"
+              >
+                <h3 className="text-3xl font-light text-white tracking-tight">{t('tap_to_speak')}</h3>
+                <p className="text-[#e0d8d0]/30 text-sm">{t('start_voice_session')}</p>
+              </motion.div>
             )}
-          </div>
-        </section>
+          </AnimatePresence>
+        </div>
 
-        <section className="p-10 bg-white/[0.02] border border-white/5 rounded-[3rem] space-y-8 flex flex-col justify-center">
-          <div className="space-y-2">
-            <h3 className="text-2xl font-medium text-white tracking-tight">{t('smart_insights')}</h3>
-            <p className="text-[#e0d8d0]/30">{t('ai_suggestions')}</p>
-          </div>
-          <div className="space-y-8">
-            <div className="flex gap-6">
-              <div className="w-12 h-12 shrink-0 bg-[#ff4e00]/10 rounded-2xl flex items-center justify-center">
-                <Logo size={24} className="select-none pointer-events-none" />
-              </div>
-              <p className="text-lg text-[#e0d8d0]/60 leading-relaxed">
-                {t('urgent_tasks_prefix')} <span className="text-white font-medium select-none pointer-events-none">{reminders.filter(r => r.priority === 'high').length} urgent</span> {t('urgent_tasks_suffix')}
-              </p>
-            </div>
-            <div className="p-6 bg-white/5 rounded-3xl border border-white/5">
-              <p className="text-[10px] text-[#ff4e00] uppercase tracking-[0.2em] mb-3 font-black">{t('pro_tip')}</p>
-              <p className="text-[#e0d8d0]/60 italic text-lg leading-relaxed">{t('pro_tip_desc')}</p>
-            </div>
-          </div>
-        </section>
+        <AnimatePresence>
+          {error && (
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="flex items-center gap-3 p-5 bg-red-500/5 border border-red-500/10 rounded-3xl text-red-400 text-sm"
+            >
+              <AlertCircle className="w-5 h-5 shrink-0" />
+              <p>{error}</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
+  );
+}
+
+export default function AssistantPage() {
+  const { t } = useLanguage();
+  return (
+    <Suspense fallback={<div className="flex-1 flex items-center justify-center text-white/40 italic">{t('loading_assistant')}</div>}>
+      <AssistantContent />
+    </Suspense>
   );
 }
