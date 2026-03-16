@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "Reminder": {
+      "title": "Reminder",
+      "description": "A personal reminder or task.",
+      "type": "object",
+      "properties": {
+        "task": {
+          "type": "string",
+          "description": "The description of the task."
+        },
+        "datetime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The date and time for the reminder."
+        },
+        "repeat": {
+          "type": "string",
+          "enum": ["none", "daily", "weekly", "monthly"],
+          "description": "Recurrence pattern."
+        },
+        "original_text": {
+          "type": "string",
+          "description": "The original voice command text."
+        },
+        "userId": {
+          "type": "string",
+          "description": "The owner of the reminder."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the reminder was created."
+        }
+      },
+      "required": ["task", "datetime", "userId"]
+    }
+  },
+  "firestore": {
+    "reminders/{reminderId}": {
+      "schema": "Reminder",
+      "description": "Collection of user reminders."
+    }
+  }
+}

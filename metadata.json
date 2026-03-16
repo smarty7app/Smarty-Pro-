@@ -1,0 +1,5 @@
+{
+  "name": "Smarty Pro",
+  "description": "صديقك الذكي لتنظيم المواعيد والتذكيرات عبر الصوت.",
+  "requestFramePermissions": ["microphone"]
+}
