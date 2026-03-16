@@ -12,7 +12,7 @@ interface LanguageContextType {
 
 const translations = {
   ar: {
-    welcome: "مرحباً بك في Smartry",
+    welcome: "مرحباً بك في Smarty",
     assistant: "المساعد الصوتي",
     reminders: "التذكيرات",
     settings: "الإعدادات",
